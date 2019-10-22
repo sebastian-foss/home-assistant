@@ -1,69 +1,110 @@
-"""
-Offer template automation rules.
-
-For more details about this automation rule, please refer to the documentation
-at https://home-assistant.io/components/automation/#template-trigger
-"""
+"""Offer template automation rules."""
 import logging
 
 import voluptuous as vol
 
-from homeassistant.const import (
-    CONF_VALUE_TEMPLATE, EVENT_STATE_CHANGED, CONF_PLATFORM)
-from homeassistant.exceptions import TemplateError
-from homeassistant.helpers import template
-import homeassistant.helpers.config_validation as cv
+from homeassistant.core import callback
+from homeassistant.const import CONF_VALUE_TEMPLATE, CONF_PLATFORM, CONF_FOR
+from homeassistant import exceptions
+from homeassistant.helpers import condition
+from homeassistant.helpers.event import async_track_same_state, async_track_template
+from homeassistant.helpers import config_validation as cv, template
 
+
+# mypy: allow-untyped-defs, no-check-untyped-defs
 
 _LOGGER = logging.getLogger(__name__)
 
-TRIGGER_SCHEMA = IF_ACTION_SCHEMA = vol.Schema({
-    vol.Required(CONF_PLATFORM): 'template',
-    vol.Required(CONF_VALUE_TEMPLATE): cv.template,
-})
+TRIGGER_SCHEMA = IF_ACTION_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_PLATFORM): "template",
+        vol.Required(CONF_VALUE_TEMPLATE): cv.template,
+        vol.Optional(CONF_FOR): vol.Any(
+            vol.All(cv.time_period, cv.positive_timedelta),
+            cv.template,
+            cv.template_complex,
+        ),
+    }
+)
 
 
-def trigger(hass, config, action):
+async def async_attach_trigger(hass, config, action, automation_info):
     """Listen for state changes based on configuration."""
     value_template = config.get(CONF_VALUE_TEMPLATE)
+    value_template.hass = hass
+    time_delta = config.get(CONF_FOR)
+    template.attach(hass, time_delta)
+    unsub_track_same = None
 
-    # Local variable to keep track of if the action has already been triggered
-    already_triggered = False
-
-    def event_listener(event):
+    @callback
+    def template_listener(entity_id, from_s, to_s):
         """Listen for state changes and calls action."""
-        nonlocal already_triggered
-        template_result = _check_template(hass, value_template)
+        nonlocal unsub_track_same
 
-        # Check to see if template returns true
-        if template_result and not already_triggered:
-            already_triggered = True
-            action()
-        elif not template_result:
-            already_triggered = False
+        @callback
+        def call_action():
+            """Call action with right context."""
+            hass.async_run_job(
+                action(
+                    {
+                        "trigger": {
+                            "platform": "template",
+                            "entity_id": entity_id,
+                            "from_state": from_s,
+                            "to_state": to_s,
+                            "for": time_delta if not time_delta else period,
+                        }
+                    },
+                    context=(to_s.context if to_s else None),
+                )
+            )
 
-    hass.bus.listen(EVENT_STATE_CHANGED, event_listener)
-    return True
+        if not time_delta:
+            call_action()
+            return
 
+        variables = {
+            "trigger": {
+                "platform": "template",
+                "entity_id": entity_id,
+                "from_state": from_s,
+                "to_state": to_s,
+            }
+        }
 
-def if_action(hass, config):
-    """Wrap action method with state based condition."""
-    value_template = config.get(CONF_VALUE_TEMPLATE)
+        try:
+            if isinstance(time_delta, template.Template):
+                period = vol.All(cv.time_period, cv.positive_timedelta)(
+                    time_delta.async_render(variables)
+                )
+            elif isinstance(time_delta, dict):
+                time_delta_data = {}
+                time_delta_data.update(template.render_complex(time_delta, variables))
+                period = vol.All(cv.time_period, cv.positive_timedelta)(time_delta_data)
+            else:
+                period = time_delta
+        except (exceptions.TemplateError, vol.Invalid) as ex:
+            _LOGGER.error(
+                "Error rendering '%s' for template: %s", automation_info["name"], ex
+            )
+            return
 
-    return lambda: _check_template(hass, value_template)
+        unsub_track_same = async_track_same_state(
+            hass,
+            period,
+            call_action,
+            lambda _, _2, _3: condition.async_template(hass, value_template),
+            value_template.extract_entities(),
+        )
 
+    unsub = async_track_template(hass, value_template, template_listener)
 
-def _check_template(hass, value_template):
-    """Check if result of template is true."""
-    try:
-        value = template.render(hass, value_template, {})
-    except TemplateError as ex:
-        if ex.args and ex.args[0].startswith(
-                "UndefinedError: 'None' has no attribute"):
-            # Common during HA startup - so just a warning
-            _LOGGER.warning(ex)
-        else:
-            _LOGGER.error(ex)
-        return False
+    @callback
+    def async_remove():
+        """Remove state listeners async."""
+        unsub()
+        if unsub_track_same:
+            # pylint: disable=not-callable
+            unsub_track_same()
 
-    return value.lower() == 'true'
+    return async_remove

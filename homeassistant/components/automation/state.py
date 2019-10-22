@@ -1,120 +1,144 @@
-"""
-Offer state listening automation rules.
-
-For more details about this automation rule, please refer to the documentation
-at https://home-assistant.io/components/automation/#state-trigger
-"""
+"""Offer state listening automation rules."""
 from datetime import timedelta
+import logging
+from typing import Dict
 
 import voluptuous as vol
 
-import homeassistant.util.dt as dt_util
-from homeassistant.const import (
-    EVENT_STATE_CHANGED, EVENT_TIME_CHANGED, MATCH_ALL, CONF_PLATFORM)
-from homeassistant.components.automation.time import (
-    CONF_HOURS, CONF_MINUTES, CONF_SECONDS)
-from homeassistant.helpers.event import track_state_change, track_point_in_time
-import homeassistant.helpers.config_validation as cv
+from homeassistant import exceptions
+from homeassistant.core import HomeAssistant, CALLBACK_TYPE, callback
+from homeassistant.const import MATCH_ALL, CONF_PLATFORM, CONF_FOR
+from homeassistant.helpers import config_validation as cv, template
+from homeassistant.helpers.event import async_track_state_change, async_track_same_state
+
+
+# mypy: allow-incomplete-defs, allow-untyped-calls, allow-untyped-defs
+# mypy: no-check-untyped-defs
+
+_LOGGER = logging.getLogger(__name__)
 
 CONF_ENTITY_ID = "entity_id"
 CONF_FROM = "from"
 CONF_TO = "to"
-CONF_STATE = "state"
-CONF_FOR = "for"
 
-BASE_SCHEMA = vol.Schema({
-    vol.Required(CONF_PLATFORM): 'state',
-    vol.Required(CONF_ENTITY_ID): cv.entity_id,
-    # These are str on purpose. Want to catch YAML conversions
-    CONF_STATE: str,
-    CONF_FOR: vol.All(vol.Schema({
-        CONF_HOURS: vol.Coerce(int),
-        CONF_MINUTES: vol.Coerce(int),
-        CONF_SECONDS: vol.Coerce(int),
-    }), cv.has_at_least_one_key(CONF_HOURS, CONF_MINUTES, CONF_SECONDS)),
-})
-
-TRIGGER_SCHEMA = vol.Schema(vol.All(
-    BASE_SCHEMA.extend({
-        # These are str on purpose. Want to catch YAML conversions
-        CONF_FROM: str,
-        CONF_TO: str,
-    }),
-    vol.Any(cv.key_dependency(CONF_FOR, CONF_TO),
-            cv.key_dependency(CONF_FOR, CONF_STATE))
-))
-
-IF_ACTION_SCHEMA = vol.Schema(vol.All(
-    BASE_SCHEMA,
-    cv.key_dependency(CONF_FOR, CONF_STATE)
-))
+TRIGGER_SCHEMA = vol.All(
+    vol.Schema(
+        {
+            vol.Required(CONF_PLATFORM): "state",
+            vol.Required(CONF_ENTITY_ID): cv.entity_ids,
+            # These are str on purpose. Want to catch YAML conversions
+            vol.Optional(CONF_FROM): str,
+            vol.Optional(CONF_TO): str,
+            vol.Optional(CONF_FOR): vol.Any(
+                vol.All(cv.time_period, cv.positive_timedelta),
+                cv.template,
+                cv.template_complex,
+            ),
+        }
+    ),
+    cv.key_dependency(CONF_FOR, CONF_TO),
+)
 
 
-def get_time_config(config):
-    """Helper function to extract the time specified in the configuration."""
-    if CONF_FOR not in config:
-        return None
-
-    hours = config[CONF_FOR].get(CONF_HOURS)
-    minutes = config[CONF_FOR].get(CONF_MINUTES)
-    seconds = config[CONF_FOR].get(CONF_SECONDS)
-
-    return timedelta(hours=(hours or 0.0),
-                     minutes=(minutes or 0.0),
-                     seconds=(seconds or 0.0))
-
-
-def trigger(hass, config, action):
+async def async_attach_trigger(
+    hass: HomeAssistant,
+    config,
+    action,
+    automation_info,
+    *,
+    platform_type: str = "state",
+) -> CALLBACK_TYPE:
     """Listen for state changes based on configuration."""
     entity_id = config.get(CONF_ENTITY_ID)
     from_state = config.get(CONF_FROM, MATCH_ALL)
-    to_state = config.get(CONF_TO) or config.get(CONF_STATE) or MATCH_ALL
-    time_delta = get_time_config(config)
+    to_state = config.get(CONF_TO, MATCH_ALL)
+    time_delta = config.get(CONF_FOR)
+    template.attach(hass, time_delta)
+    match_all = from_state == MATCH_ALL and to_state == MATCH_ALL
+    unsub_track_same = {}
+    period: Dict[str, timedelta] = {}
 
+    @callback
     def state_automation_listener(entity, from_s, to_s):
         """Listen for state changes and calls action."""
-        def state_for_listener(now):
-            """Fire on state changes after a delay and calls action."""
-            hass.bus.remove_listener(
-                EVENT_STATE_CHANGED, for_state_listener)
-            action()
 
-        def state_for_cancel_listener(entity, inner_from_s, inner_to_s):
-            """Fire on changes and cancel for listener if changed."""
-            if inner_to_s == to_s:
-                return
-            hass.bus.remove_listener(EVENT_TIME_CHANGED, for_time_listener)
-            hass.bus.remove_listener(
-                EVENT_STATE_CHANGED, for_state_listener)
+        @callback
+        def call_action():
+            """Call action with right context."""
+            hass.async_run_job(
+                action(
+                    {
+                        "trigger": {
+                            "platform": platform_type,
+                            "entity_id": entity,
+                            "from_state": from_s,
+                            "to_state": to_s,
+                            "for": time_delta if not time_delta else period[entity],
+                        }
+                    },
+                    context=to_s.context,
+                )
+            )
 
-        if time_delta is not None:
-            target_tm = dt_util.utcnow() + time_delta
-            for_time_listener = track_point_in_time(
-                hass, state_for_listener, target_tm)
-            for_state_listener = track_state_change(
-                hass, entity_id, state_for_cancel_listener,
-                MATCH_ALL, MATCH_ALL)
-        else:
-            action()
+        # Ignore changes to state attributes if from/to is in use
+        if (
+            not match_all
+            and from_s is not None
+            and to_s is not None
+            and from_s.state == to_s.state
+        ):
+            return
 
-    track_state_change(
-        hass, entity_id, state_automation_listener, from_state, to_state)
+        if not time_delta:
+            call_action()
+            return
 
-    return True
+        variables = {
+            "trigger": {
+                "platform": "state",
+                "entity_id": entity,
+                "from_state": from_s,
+                "to_state": to_s,
+            }
+        }
 
+        try:
+            if isinstance(time_delta, template.Template):
+                period[entity] = vol.All(cv.time_period, cv.positive_timedelta)(
+                    time_delta.async_render(variables)
+                )
+            elif isinstance(time_delta, dict):
+                time_delta_data = {}
+                time_delta_data.update(template.render_complex(time_delta, variables))
+                period[entity] = vol.All(cv.time_period, cv.positive_timedelta)(
+                    time_delta_data
+                )
+            else:
+                period[entity] = time_delta
+        except (exceptions.TemplateError, vol.Invalid) as ex:
+            _LOGGER.error(
+                "Error rendering '%s' for template: %s", automation_info["name"], ex
+            )
+            return
 
-def if_action(hass, config):
-    """Wrap action method with state based condition."""
-    entity_id = config.get(CONF_ENTITY_ID)
-    state = config.get(CONF_STATE)
-    time_delta = get_time_config(config)
+        unsub_track_same[entity] = async_track_same_state(
+            hass,
+            period[entity],
+            call_action,
+            lambda _, _2, to_state: to_state.state == to_s.state,
+            entity_ids=entity,
+        )
 
-    def if_state():
-        """Test if condition."""
-        is_state = hass.states.is_state(entity_id, state)
-        return (time_delta is None and is_state or
-                time_delta is not None and
-                dt_util.utcnow() - time_delta >
-                hass.states.get(entity_id).last_changed)
+    unsub = async_track_state_change(
+        hass, entity_id, state_automation_listener, from_state, to_state
+    )
 
-    return if_state
+    @callback
+    def async_remove():
+        """Remove state listeners async."""
+        unsub()
+        for async_remove in unsub_track_same.values():
+            async_remove()
+        unsub_track_same.clear()
+
+    return async_remove

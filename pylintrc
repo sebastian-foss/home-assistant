@@ -1,24 +1,58 @@
 [MASTER]
-reports=no
+ignore=tests
 
+[BASIC]
+good-names=id,i,j,k,ex,Run,_,fp
+
+[MESSAGES CONTROL]
 # Reasons disabled:
+# format - handled by black
 # locally-disabled - it spams too much
 # duplicate-code - unavoidable
 # cyclic-import - doesn't test if both import on load
-# abstract-class-little-used - Prevents from setting right foundation
-# abstract-class-not-used - is flaky, should not show up but does
+# abstract-class-little-used - prevents from setting right foundation
 # unused-argument - generic callbacks and setup methods create a lot of warnings
 # global-statement - used for the on-demand requirement installation
 # redefined-variable-type - this is Python, we're duck typing!
+# too-many-* - are not enforced for the sake of readability
+# too-few-* - same as too-many-*
+# abstract-method - with intro of async there are always methods missing
+# inconsistent-return-statements - doesn't handle raise
+# unnecessary-pass - readability for functions which only contain pass
+# import-outside-toplevel - TODO
 disable=
-  locally-disabled,
-  duplicate-code,
-  cyclic-import,
+  format,
   abstract-class-little-used,
-  abstract-class-not-used,
-  unused-argument,
+  abstract-method,
+  cyclic-import,
+  duplicate-code,
   global-statement,
-  redefined-variable-type
+  import-outside-toplevel,
+  inconsistent-return-statements,
+  locally-disabled,
+  not-context-manager,
+  redefined-variable-type,
+  too-few-public-methods,
+  too-many-arguments,
+  too-many-branches,
+  too-many-instance-attributes,
+  too-many-lines,
+  too-many-locals,
+  too-many-public-methods,
+  too-many-return-statements,
+  too-many-statements,
+  unnecessary-pass,
+  unused-argument
+
+[REPORTS]
+reports=no
+
+[TYPECHECK]
+# For attrs
+ignored-classes=_CountingAttr
+
+[FORMAT]
+expected-line-ending-format=LF
 
 [EXCEPTIONS]
 overgeneral-exceptions=Exception,HomeAssistantError

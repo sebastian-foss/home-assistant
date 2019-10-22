@@ -1,37 +1,55 @@
-"""
-Offer MQTT listening automation rules.
+"""Offer MQTT listening automation rules."""
+import json
 
-For more details about this automation rule, please refer to the documentation
-at https://home-assistant.io/components/automation/#mqtt-trigger
-"""
 import voluptuous as vol
 
-import homeassistant.components.mqtt as mqtt
-from homeassistant.const import CONF_PLATFORM
+from homeassistant.core import callback
+from homeassistant.components import mqtt
+from homeassistant.const import CONF_PLATFORM, CONF_PAYLOAD
 import homeassistant.helpers.config_validation as cv
 
-DEPENDENCIES = ['mqtt']
 
-CONF_TOPIC = 'topic'
-CONF_PAYLOAD = 'payload'
+# mypy: allow-untyped-defs
 
-TRIGGER_SCHEMA = vol.Schema({
-    vol.Required(CONF_PLATFORM): mqtt.DOMAIN,
-    vol.Required(CONF_TOPIC): mqtt.valid_subscribe_topic,
-    vol.Optional(CONF_PAYLOAD): cv.string,
-})
+CONF_ENCODING = "encoding"
+CONF_TOPIC = "topic"
+DEFAULT_ENCODING = "utf-8"
+
+TRIGGER_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_PLATFORM): mqtt.DOMAIN,
+        vol.Required(CONF_TOPIC): mqtt.valid_subscribe_topic,
+        vol.Optional(CONF_PAYLOAD): cv.string,
+        vol.Optional(CONF_ENCODING, default=DEFAULT_ENCODING): cv.string,
+    }
+)
 
 
-def trigger(hass, config, action):
+async def async_attach_trigger(hass, config, action, automation_info):
     """Listen for state changes based on configuration."""
     topic = config[CONF_TOPIC]
     payload = config.get(CONF_PAYLOAD)
+    encoding = config[CONF_ENCODING] or None
 
-    def mqtt_automation_listener(msg_topic, msg_payload, qos):
+    @callback
+    def mqtt_automation_listener(mqttmsg):
         """Listen for MQTT messages."""
-        if payload is None or payload == msg_payload:
-            action()
+        if payload is None or payload == mqttmsg.payload:
+            data = {
+                "platform": "mqtt",
+                "topic": mqttmsg.topic,
+                "payload": mqttmsg.payload,
+                "qos": mqttmsg.qos,
+            }
 
-    mqtt.subscribe(hass, topic, mqtt_automation_listener)
+            try:
+                data["payload_json"] = json.loads(mqttmsg.payload)
+            except ValueError:
+                pass
 
-    return True
+            hass.async_run_job(action, {"trigger": data})
+
+    remove = await mqtt.async_subscribe(
+        hass, topic, mqtt_automation_listener, encoding=encoding
+    )
+    return remove
